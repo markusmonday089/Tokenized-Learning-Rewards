@@ -92,3 +92,65 @@
         (ok (var-set contract-owner new-owner))
     )
 )
+
+
+(define-map milestone-categories uint (string-utf8 32))
+
+(define-map milestone-category-mapping uint uint)
+
+(define-read-only (get-milestone-category (category-id uint))
+    (map-get? milestone-categories category-id)
+)
+
+(define-read-only (get-milestones-by-category (category-id uint))
+    (map-get? milestone-category-mapping category-id)
+)
+
+(define-public (set-milestone-category (category-id uint) (category-name (string-utf8 32)))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (ok (map-set milestone-categories category-id category-name))
+    )
+)
+
+(define-public (assign-milestone-category (milestone-id uint) (category-id uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (<= milestone-id (var-get total-milestones)) ERR-INVALID-MILESTONE)
+        (ok (map-set milestone-category-mapping milestone-id category-id))
+    )
+)
+
+
+(define-map badges uint {
+    name: (string-utf8 64),
+    description: (string-utf8 256),
+    required-points: uint
+})
+
+(define-map user-badges { user: principal, badge-id: uint } bool)
+
+(define-read-only (get-badge (badge-id uint))
+    (map-get? badges badge-id)
+)
+
+(define-read-only (has-badge (user principal) (badge-id uint))
+    (default-to false (map-get? user-badges { user: user, badge-id: badge-id }))
+)
+
+(define-public (create-badge (badge-id uint) (badge-data { name: (string-utf8 64), description: (string-utf8 256), required-points: uint }))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (ok (map-set badges badge-id badge-data))
+    )
+)
+
+(define-public (check-and-award-badge (badge-id uint))
+    (let (
+        (badge (unwrap! (map-get? badges badge-id) ERR-INVALID-MILESTONE))
+        (user-stats (get-user-progress tx-sender))
+    )
+        (asserts! (>= (get total-points user-stats) (get required-points badge)) ERR-NOT-AUTHORIZED)
+        (ok (map-set user-badges { user: tx-sender, badge-id: badge-id } true))
+    )
+)
