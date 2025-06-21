@@ -154,3 +154,118 @@
         (ok (map-set user-badges { user: tx-sender, badge-id: badge-id } true))
     )
 )
+
+
+(define-constant ERR-NO-ACTIVITY-TODAY (err u104))
+(define-constant ERR-STREAK-ALREADY-CLAIMED (err u105))
+
+(define-data-var streak-bonus-multiplier uint u10)
+(define-data-var max-streak-bonus uint u1000)
+
+(define-map user-streaks principal {
+    current-streak: uint,
+    longest-streak: uint,
+    last-activity-day: uint,
+    streak-tokens-earned: uint
+})
+
+(define-map daily-streak-claims { user: principal, day: uint } bool)
+
+(define-read-only (get-current-day)
+    (/ stacks-block-height u144)
+)
+
+(define-read-only (get-user-streak (user principal))
+    (default-to 
+        { current-streak: u0, longest-streak: u0, last-activity-day: u0, streak-tokens-earned: u0 }
+        (map-get? user-streaks user)
+    )
+)
+
+(define-read-only (min (a uint) (b uint))
+    (if (<= a b) a b)
+)
+
+(define-read-only (calculate-streak-bonus (streak-days uint))
+    (min (* streak-days (var-get streak-bonus-multiplier)) (var-get max-streak-bonus))
+)
+
+(define-read-only (has-claimed-streak-today (user principal))
+    (default-to false (map-get? daily-streak-claims { user: user, day: (get-current-day) }))
+)
+
+(define-read-only (max (a uint) (b uint))
+    (if (>= a b) a b)
+)
+
+(define-private (update-user-streak (user principal))
+    (let (
+        (current-day (get-current-day))
+        (user-streak (get-user-streak user))
+        (last-day (get last-activity-day user-streak))
+        (current-streak-count (get current-streak user-streak))
+        (new-streak (if (is-eq (+ last-day u1) current-day)
+                       (+ current-streak-count u1)
+                       u1))
+    )
+        (map-set user-streaks user {
+            current-streak: new-streak,
+            longest-streak: (max new-streak (get longest-streak user-streak)),
+            last-activity-day: current-day,
+            streak-tokens-earned: (get streak-tokens-earned user-streak)
+        })
+        new-streak
+    )
+)
+
+(define-public (claim-daily-streak-bonus)
+    (let (
+        (current-day (get-current-day))
+        (user-streak (get-user-streak tx-sender))
+        (user-progresss (get-user-progress tx-sender))
+    )
+        (asserts! (not (has-claimed-streak-today tx-sender)) ERR-STREAK-ALREADY-CLAIMED)
+        (asserts! (is-eq (get last-activity-day user-streak) current-day) ERR-NO-ACTIVITY-TODAY)
+        (let (
+            (streak-bonus (calculate-streak-bonus (get current-streak user-streak)))
+        )
+            (map-set daily-streak-claims { user: tx-sender, day: current-day } true)
+            (map-set user-streaks tx-sender (merge user-streak {
+                streak-tokens-earned: (+ (get streak-tokens-earned user-streak) streak-bonus)
+            }))
+            (ft-mint? learning-token streak-bonus tx-sender)
+        )
+    )
+)
+
+(define-public (set-streak-bonus-multiplier (new-multiplier uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (ok (var-set streak-bonus-multiplier new-multiplier))
+    )
+)
+
+(define-public (set-max-streak-bonus (new-max uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (ok (var-set max-streak-bonus new-max))
+    )
+)
+
+(define-public (claim-milestone-with-streak (milestone-id uint))
+    (let (
+        (milestone (unwrap! (map-get? milestones milestone-id) ERR-INVALID-MILESTONE))
+        (current-progress (get-user-progress tx-sender))
+        (claim-status (has-claimed-milestone tx-sender milestone-id))
+        (new-streak (update-user-streak tx-sender))
+    )
+        (asserts! (not claim-status) ERR-ALREADY-CLAIMED)
+        (map-set milestone-claims { user: tx-sender, milestone: milestone-id } true)
+        (map-set user-progress tx-sender {
+            completed-milestones: (unwrap-panic (as-max-len? (append (get completed-milestones current-progress) milestone-id) u100)),
+            total-points: (+ (get total-points current-progress) (get points milestone)),
+            tokens-earned: (+ (get tokens-earned current-progress) (get points milestone))
+        })
+        (ft-mint? learning-token (get points milestone) tx-sender)
+    )
+)
