@@ -290,3 +290,121 @@
         (ft-mint? learning-token (get points milestone) tx-sender)
     )
 )
+
+(define-read-only (get-referral-code (user principal))
+    (map-get? user-referral-codes user)
+)
+
+(define-read-only (get-referral-code-owner (referral-code uint))
+    (map-get? referral-code-owners referral-code)
+)
+
+(define-read-only (get-user-referrer (user principal))
+    (map-get? user-referrers user)
+)
+
+(define-read-only (get-referrer-stats (referrer principal))
+    (default-to 
+        { total-referrals: u0, active-referrals: u0, total-rewards-earned: u0, successful-referrals: u0 }
+        (map-get? referrer-stats referrer)
+    )
+)
+
+(define-read-only (get-referral-reward-earned (referrer principal) (referee principal))
+    (default-to u0 (map-get? referral-rewards { referrer: referrer, referee: referee }))
+)
+
+(define-read-only (calculate-referral-reward (milestone-points uint))
+    (/ (* milestone-points (var-get referral-reward-percentage)) u100)
+)
+
+(define-public (generate-referral-code)
+    (let (
+        (new-code (+ (var-get referral-code-counter) u1))
+        (user tx-sender)
+    )
+        (asserts! (is-none (get-referral-code user)) ERR-ALREADY-REFERRED)
+        (map-set user-referral-codes user new-code)
+        (map-set referral-code-owners new-code user)
+        (var-set referral-code-counter new-code)
+        (ok new-code)
+    )
+)
+
+(define-public (register-with-referrer (referral-code uint))
+    (let (
+        (referrer (unwrap! (get-referral-code-owner referral-code) ERR-REFERRER-NOT-FOUND))
+        (referee tx-sender)
+    )
+        (asserts! (not (is-eq referrer referee)) ERR-SELF-REFERRAL)
+        (asserts! (is-none (get-user-referrer referee)) ERR-ALREADY-REFERRED)
+        (map-set user-referrers referee referrer)
+        (let (
+            (current-stats (get-referrer-stats referrer))
+        )
+            (map-set referrer-stats referrer {
+                total-referrals: (+ (get total-referrals current-stats) u1),
+                active-referrals: (+ (get active-referrals current-stats) u1),
+                total-rewards-earned: (get total-rewards-earned current-stats),
+                successful-referrals: (get successful-referrals current-stats)
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (claim-milestone-with-referral (milestone-id uint))
+    (let (
+        (milestone (unwrap! (map-get? milestones milestone-id) ERR-INVALID-MILESTONE))
+        (current-progress (get-user-progress tx-sender))
+        (claim-status (has-claimed-milestone tx-sender milestone-id))
+        (milestone-points (get points milestone))
+    )
+        (asserts! (not claim-status) ERR-ALREADY-CLAIMED)
+        (map-set milestone-claims { user: tx-sender, milestone: milestone-id } true)
+        (map-set user-progress tx-sender {
+            completed-milestones: (unwrap-panic (as-max-len? (append (get completed-milestones current-progress) milestone-id) u100)),
+            total-points: (+ (get total-points current-progress) milestone-points),
+            tokens-earned: (+ (get tokens-earned current-progress) milestone-points)
+        })
+        (unwrap-panic (ft-mint? learning-token milestone-points tx-sender))
+        (match (get-user-referrer tx-sender)
+            referrer (begin
+                (if (>= milestone-points (var-get minimum-milestone-points))
+                    (let (
+                        (referral-reward (calculate-referral-reward milestone-points))
+                        (current-reward (get-referral-reward-earned referrer tx-sender))
+                        (current-stats (get-referrer-stats referrer))
+                    )
+                        (map-set referral-rewards { referrer: referrer, referee: tx-sender } (+ current-reward referral-reward))
+                        (map-set referrer-stats referrer {
+                            total-referrals: (get total-referrals current-stats),
+                            active-referrals: (get active-referrals current-stats),
+                            total-rewards-earned: (+ (get total-rewards-earned current-stats) referral-reward),
+                            successful-referrals: (+ (get successful-referrals current-stats) u1)
+                        })
+                        (unwrap-panic (ft-mint? learning-token referral-reward referrer))
+                    )
+                    false
+                )
+            )
+            false
+        )
+        (ok true)
+    )
+)
+
+(define-public (set-referral-reward-percentage (new-percentage uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (<= new-percentage u50) ERR-NOT-AUTHORIZED)
+        (ok (var-set referral-reward-percentage new-percentage))
+    )
+)
+
+(define-public (set-minimum-milestone-points (new-minimum uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (ok (var-set minimum-milestone-points new-minimum))
+    )
+)
