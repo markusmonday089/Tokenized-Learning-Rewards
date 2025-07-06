@@ -13,6 +13,27 @@
 (define-data-var token-uri (string-utf8 256) u"https://learning-rewards.xyz/token")
 (define-data-var contract-owner principal tx-sender)
 (define-data-var total-milestones uint u100)
+(define-constant ERR-INVALID-REFERRER (err u106))
+(define-constant ERR-ALREADY-REFERRED (err u107))
+(define-constant ERR-SELF-REFERRAL (err u108))
+(define-constant ERR-REFERRER-NOT-FOUND (err u109))
+
+(define-data-var referral-reward-percentage uint u20)
+(define-data-var minimum-milestone-points uint u50)
+(define-data-var referral-code-counter uint u0)
+
+(define-map user-referral-codes principal uint)
+(define-map referral-code-owners uint principal)
+(define-map user-referrers principal principal)
+(define-map referrer-stats principal {
+    total-referrals: uint,
+    active-referrals: uint,
+    total-rewards-earned: uint,
+    successful-referrals: uint
+})
+
+(define-map referral-rewards { referrer: principal, referee: principal } uint)
+
 
 (define-map milestones uint {
     name: (string-utf8 64),
