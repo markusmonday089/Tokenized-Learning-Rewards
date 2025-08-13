@@ -408,3 +408,278 @@
         (ok (var-set minimum-milestone-points new-minimum))
     )
 )
+
+;; Learning Time Banking System
+;; Users can log study time, accumulate time credits, and exchange for rewards
+
+(define-constant ERR-INVALID-TIME-AMOUNT (err u110))
+(define-constant ERR-INSUFFICIENT-TIME-CREDITS (err u111))
+(define-constant ERR-INVALID-SESSION (err u112))
+(define-constant ERR-SESSION-TOO-LONG (err u113))
+(define-constant ERR-INVALID-EXCHANGE-RATE (err u114))
+
+;; Time banking configuration variables
+(define-data-var time-to-token-rate uint u5) ;; 5 minutes = 1 token
+(define-data-var max-session-minutes uint u480) ;; 8 hours max per session
+(define-data-var daily-time-bonus-threshold uint u120) ;; 2 hours daily bonus threshold
+(define-data-var time-bonus-multiplier uint u15) ;; 15% bonus for hitting daily threshold
+
+;; Time credit system - tracks accumulated study time in minutes
+(define-map user-time-credits principal {
+    total-minutes: uint,
+    available-credits: uint,
+    redeemed-credits: uint,
+    sessions-completed: uint
+})
+
+;; Daily time tracking for bonus calculations
+(define-map daily-time-logs { user: principal, day: uint } {
+    minutes-logged: uint,
+    sessions-count: uint,
+    bonus-claimed: bool
+})
+
+;; Study session records for analytics
+(define-map study-sessions uint {
+    user: principal,
+    start-block: uint,
+    minutes-logged: uint,
+    subject-category: (string-utf8 32),
+    day: uint
+})
+
+;; Time transfer system for peer collaboration
+(define-map time-transfers { sender: principal, recipient: principal, session-id: uint } uint)
+
+;; Session counter for unique session IDs
+(define-data-var session-counter uint u0)
+
+;; Read-only functions for time banking system
+(define-read-only (get-user-time-credits (user principal))
+    (default-to 
+        { total-minutes: u0, available-credits: u0, redeemed-credits: u0, sessions-completed: u0 }
+        (map-get? user-time-credits user)
+    )
+)
+
+(define-read-only (get-daily-time-log (user principal) (day uint))
+    (default-to 
+        { minutes-logged: u0, sessions-count: u0, bonus-claimed: false }
+        (map-get? daily-time-logs { user: user, day: day })
+    )
+)
+
+(define-read-only (get-study-session (session-id uint))
+    (map-get? study-sessions session-id)
+)
+
+(define-read-only (get-time-transfer (sender principal) (recipient principal) (session-id uint))
+    (default-to u0 (map-get? time-transfers { sender: sender, recipient: recipient, session-id: session-id }))
+)
+
+(define-read-only (calculate-time-token-value (minutes uint))
+    (/ minutes (var-get time-to-token-rate))
+)
+
+(define-read-only (calculate-daily-bonus (minutes uint))
+    (if (>= minutes (var-get daily-time-bonus-threshold))
+        (/ (* minutes (var-get time-bonus-multiplier)) u100)
+        u0
+    )
+)
+
+(define-read-only (get-current-learning-day)
+    (/ stacks-block-height u144) ;; Assumes 144 blocks per day
+)
+
+;; Core time banking functions
+(define-public (log-study-session (minutes uint) (subject-category (string-utf8 32)))
+    (let (
+        (session-id (+ (var-get session-counter) u1))
+        (current-day (get-current-learning-day))
+        (user tx-sender)
+        (current-credits (get-user-time-credits user))
+        (daily-log (get-daily-time-log user current-day))
+    )
+        ;; Validate session parameters
+        (asserts! (> minutes u0) ERR-INVALID-TIME-AMOUNT)
+        (asserts! (<= minutes (var-get max-session-minutes)) ERR-SESSION-TOO-LONG)
+        
+        ;; Update session counter
+        (var-set session-counter session-id)
+        
+        ;; Record the study session
+        (map-set study-sessions session-id {
+            user: user,
+            start-block: stacks-block-height,
+            minutes-logged: minutes,
+            subject-category: subject-category,
+            day: current-day
+        })
+        
+        ;; Update user time credits
+        (map-set user-time-credits user {
+            total-minutes: (+ (get total-minutes current-credits) minutes),
+            available-credits: (+ (get available-credits current-credits) minutes),
+            redeemed-credits: (get redeemed-credits current-credits),
+            sessions-completed: (+ (get sessions-completed current-credits) u1)
+        })
+        
+        ;; Update daily time log
+        (map-set daily-time-logs { user: user, day: current-day } {
+            minutes-logged: (+ (get minutes-logged daily-log) minutes),
+            sessions-count: (+ (get sessions-count daily-log) u1),
+            bonus-claimed: (get bonus-claimed daily-log)
+        })
+        
+        (ok session-id)
+    )
+)
+
+(define-public (redeem-time-credits (credits-to-redeem uint))
+    (let (
+        (user tx-sender)
+        (current-credits (get-user-time-credits user))
+        (available (get available-credits current-credits))
+        (tokens-to-mint (calculate-time-token-value credits-to-redeem))
+    )
+        ;; Validate redemption amount
+        (asserts! (> credits-to-redeem u0) ERR-INVALID-TIME-AMOUNT)
+        (asserts! (<= credits-to-redeem available) ERR-INSUFFICIENT-TIME-CREDITS)
+        
+        ;; Update user credits
+        (map-set user-time-credits user {
+            total-minutes: (get total-minutes current-credits),
+            available-credits: (- available credits-to-redeem),
+            redeemed-credits: (+ (get redeemed-credits current-credits) credits-to-redeem),
+            sessions-completed: (get sessions-completed current-credits)
+        })
+        
+        ;; Mint tokens based on time credits
+        (ft-mint? learning-token tokens-to-mint user)
+    )
+)
+
+(define-public (claim-daily-time-bonus)
+    (let (
+        (current-day (get-current-learning-day))
+        (user tx-sender)
+        (daily-log (get-daily-time-log user current-day))
+        (minutes-today (get minutes-logged daily-log))
+        (bonus-amount (calculate-daily-bonus minutes-today))
+    )
+        ;; Check if bonus can be claimed
+        (asserts! (not (get bonus-claimed daily-log)) ERR-ALREADY-CLAIMED)
+        (asserts! (>= minutes-today (var-get daily-time-bonus-threshold)) ERR-INVALID-TIME-AMOUNT)
+        
+        ;; Mark bonus as claimed
+        (map-set daily-time-logs { user: user, day: current-day } {
+            minutes-logged: minutes-today,
+            sessions-count: (get sessions-count daily-log),
+            bonus-claimed: true
+        })
+        
+        ;; Mint bonus tokens
+        (ft-mint? learning-token bonus-amount user)
+    )
+)
+
+(define-public (transfer-time-credits (recipient principal) (credits-amount uint) (session-id uint))
+    (let (
+        (sender tx-sender)
+        (sender-credits (get-user-time-credits sender))
+        (recipient-credits (get-user-time-credits recipient))
+        (available (get available-credits sender-credits))
+    )
+        ;; Validate transfer
+        (asserts! (> credits-amount u0) ERR-INVALID-TIME-AMOUNT)
+        (asserts! (<= credits-amount available) ERR-INSUFFICIENT-TIME-CREDITS)
+        (asserts! (not (is-eq sender recipient)) ERR-SELF-REFERRAL)
+        
+        ;; Update sender credits
+        (map-set user-time-credits sender {
+            total-minutes: (get total-minutes sender-credits),
+            available-credits: (- available credits-amount),
+            redeemed-credits: (get redeemed-credits sender-credits),
+            sessions-completed: (get sessions-completed sender-credits)
+        })
+        
+        ;; Update recipient credits
+        (map-set user-time-credits recipient {
+            total-minutes: (+ (get total-minutes recipient-credits) credits-amount),
+            available-credits: (+ (get available-credits recipient-credits) credits-amount),
+            redeemed-credits: (get redeemed-credits recipient-credits),
+            sessions-completed: (get sessions-completed recipient-credits)
+        })
+        
+        ;; Record the transfer
+        (map-set time-transfers { sender: sender, recipient: recipient, session-id: session-id } credits-amount)
+        
+        (ok true)
+    )
+)
+
+(define-public (bulk-redeem-weekly-time)
+    (let (
+        (user tx-sender)
+        (current-credits (get-user-time-credits user))
+        (available (get available-credits current-credits))
+        (weekly-threshold u2100) ;; 35 hours = bonus rate
+        (bonus-rate u110) ;; 10% bonus for bulk weekly redemption
+    )
+        ;; Validate bulk redemption
+        (asserts! (>= available weekly-threshold) ERR-INSUFFICIENT-TIME-CREDITS)
+        
+        (let (
+            (base-tokens (calculate-time-token-value available))
+            (bonus-tokens (/ (* base-tokens bonus-rate) u100))
+            (total-tokens (+ base-tokens bonus-tokens))
+        )
+            ;; Update user credits
+            (map-set user-time-credits user {
+                total-minutes: (get total-minutes current-credits),
+                available-credits: u0,
+                redeemed-credits: (+ (get redeemed-credits current-credits) available),
+                sessions-completed: (get sessions-completed current-credits)
+            })
+            
+            ;; Mint tokens with bonus
+            (ft-mint? learning-token total-tokens user)
+        )
+    )
+)
+
+;; Owner configuration functions
+(define-public (set-time-to-token-rate (new-rate uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (> new-rate u0) ERR-INVALID-EXCHANGE-RATE)
+        (ok (var-set time-to-token-rate new-rate))
+    )
+)
+
+(define-public (set-max-session-minutes (new-max uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (> new-max u0) ERR-INVALID-TIME-AMOUNT)
+        (ok (var-set max-session-minutes new-max))
+    )
+)
+
+(define-public (set-daily-time-bonus-threshold (new-threshold uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (ok (var-set daily-time-bonus-threshold new-threshold))
+    )
+)
+
+(define-public (set-time-bonus-multiplier (new-multiplier uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (<= new-multiplier u50) ERR-NOT-AUTHORIZED)
+        (ok (var-set time-bonus-multiplier new-multiplier))
+    )
+)
+
+
+
